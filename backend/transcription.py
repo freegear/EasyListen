@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import io
 import json
+import math
 import os
 import time
 import wave
@@ -16,11 +17,6 @@ import numpy as np
 
 SAMPLE_RATE = 16000
 BYTES_PER_SECOND = SAMPLE_RATE * 2
-WINDOW_SECONDS = max(10.0, float(os.getenv("FINAL_WINDOW_SECONDS", "25")))
-OVERLAP_SECONDS = min(
-    WINDOW_SECONDS / 3,
-    max(0.5, float(os.getenv("FINAL_WINDOW_OVERLAP_SECONDS", "1.5"))),
-)
 LOW_CONFIDENCE_LOGPROB = float(os.getenv("LOW_CONFIDENCE_LOGPROB", "-0.65"))
 NO_SPEECH_REVIEW_THRESHOLD = float(
     os.getenv("NO_SPEECH_REVIEW_THRESHOLD", "0.6")
@@ -123,6 +119,13 @@ def _append_reason(segment: dict[str, Any], reason: str) -> None:
     segment["reviewRequired"] = True
 
 
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 def _collapse_adjacent_repetitions(
     segments: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -160,23 +163,6 @@ def _normalize_speech_ranges(
         else:
             normalized.append((start, end))
     return normalized
-
-
-def _window_speech_ranges(
-    speech_ranges: list[tuple[int, int]],
-) -> list[tuple[int, int]]:
-    window_bytes = int(WINDOW_SECONDS * BYTES_PER_SECOND)
-    overlap_bytes = int(OVERLAP_SECONDS * BYTES_PER_SECOND)
-    windows: list[tuple[int, int]] = []
-    for range_start, range_end in speech_ranges:
-        start = range_start
-        while start < range_end:
-            end = min(range_end, start + window_bytes)
-            windows.append((start, end))
-            if end >= range_end:
-                break
-            start = max(start + 2, end - overlap_bytes)
-    return windows
 
 
 def _merge_overlapping_segments(
@@ -266,6 +252,7 @@ class WhisperTranscriber:
         pcm_bytes: bytes,
         verbose: bool = True,
         use_prompt: bool = False,
+        condition_on_previous_text: bool = False,
     ) -> tuple[dict[str, Any], float]:
         if not await self.ready():
             raise RuntimeError("MLX Whisper 모델이 준비되지 않았습니다.")
@@ -279,7 +266,7 @@ class WhisperTranscriber:
                 language="ko",
                 task="transcribe",
                 temperature=0.0,
-                condition_on_previous_text=False,
+                condition_on_previous_text=condition_on_previous_text,
                 initial_prompt=self.prompt if use_prompt and self.prompt else None,
                 compression_ratio_threshold=COMPRESSION_RATIO_REVIEW_THRESHOLD,
                 logprob_threshold=-1.0,
@@ -336,7 +323,6 @@ class WhisperTranscriber:
                 "vadFallback": False,
             }
 
-        windows = _window_speech_ranges(normalized_ranges)
         speech_duration = sum(
             end - start for start, end in normalized_ranges
         ) / BYTES_PER_SECOND
@@ -344,20 +330,19 @@ class WhisperTranscriber:
         candidates: list[dict[str, Any]] = []
         total_latency_ms = 0.0
         transcribed_duration = 0.0
-        for index, (start_byte, end_byte) in enumerate(windows):
-            chunk = pcm_bytes[start_byte:end_byte]
-            if progress:
-                await progress(index + 1, len(windows))
-            if not contains_possible_speech(chunk):
-                continue
-            payload, latency_ms = await self.request(
-                chunk,
-                verbose=True,
-                use_prompt=True,
-            )
-            total_latency_ms += latency_ms
-            transcribed_duration += len(chunk) / BYTES_PER_SECOND
-            offset = start_byte / BYTES_PER_SECOND
+        if progress:
+            await progress(1, 1)
+        payload, latency_ms = await self.request(
+            pcm_bytes,
+            verbose=True,
+            use_prompt=True,
+            condition_on_previous_text=True,
+        )
+        total_latency_ms += latency_ms
+        transcribed_duration = duration
+        offset = 0.0
+        chunk = pcm_bytes
+        if payload:
             response_segments = payload.get("segments") or []
             response_text = str(payload.get("text", "")).strip()
             if not response_segments and response_text:
@@ -374,27 +359,20 @@ class WhisperTranscriber:
                     raw_text,
                     self.corrections,
                 )
-                avg_logprob_value = response_segment.get("avg_logprob")
-                avg_logprob = (
-                    float(avg_logprob_value)
-                    if isinstance(avg_logprob_value, (int, float))
-                    else None
+                avg_logprob = _finite_float(response_segment.get("avg_logprob"))
+                compression_ratio = _finite_float(
+                    response_segment.get("compression_ratio")
                 )
-                compression_ratio_value = response_segment.get("compression_ratio")
-                compression_ratio = (
-                    float(compression_ratio_value)
-                    if isinstance(compression_ratio_value, (int, float))
-                    else None
+                no_speech_probability = _finite_float(
+                    response_segment.get("no_speech_prob")
                 )
-                no_speech_value = response_segment.get("no_speech_prob")
-                no_speech_probability = (
-                    float(no_speech_value)
-                    if isinstance(no_speech_value, (int, float))
-                    else None
-                )
-                start = offset + float(response_segment.get("start", 0.0))
-                end = offset + float(
-                    response_segment.get("end", len(chunk) / BYTES_PER_SECOND)
+                segment_start = _finite_float(response_segment.get("start"))
+                segment_end = _finite_float(response_segment.get("end"))
+                start = offset + (segment_start if segment_start is not None else 0.0)
+                end = offset + (
+                    segment_end
+                    if segment_end is not None
+                    else len(chunk) / BYTES_PER_SECOND
                 )
                 candidate = {
                     "text": corrected_text,
@@ -451,7 +429,7 @@ class WhisperTranscriber:
             "transcribedDuration": round(transcribed_duration, 3),
             "speechDuration": round(speech_duration, 3),
             "speechRangeCount": len(normalized_ranges),
-            "windowCount": len(windows),
+            "windowCount": 1,
             "deduplicatedSegments": max(0, len(candidates) - len(merged)),
             "lowConfidenceSegments": low_confidence_count,
             "latencyMs": round(total_latency_ms),
@@ -462,6 +440,5 @@ class WhisperTranscriber:
             "model": self.model_name,
             "engine": "mlx-whisper",
             "vadFallback": vad_fallback,
-            "windowSeconds": WINDOW_SECONDS,
-            "overlapSeconds": OVERLAP_SECONDS,
+            "continuousDecoding": True,
         }

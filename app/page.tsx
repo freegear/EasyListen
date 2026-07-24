@@ -202,9 +202,9 @@ export default function Home() {
   const [selected, setSelected] = useState<Recording>(demoRecording);
   const [recording, setRecording] = useState(false);
   const [playing, setPlaying] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
+  const [recordingElapsed, setRecordingElapsed] = useState(0);
+  const [playbackElapsed, setPlaybackElapsed] = useState(0);
   const [levels, setLevels] = useState({ left: 0.08, right: 0.06 });
-  const [liveWaveform, setLiveWaveform] = useState<number[]>(EMPTY_WAVEFORM);
   const [audioDiagnostics, setAudioDiagnostics] = useState<AudioDiagnostics>({
     sampleRate: 0,
     channels: 1,
@@ -337,7 +337,7 @@ export default function Home() {
       stopPlayback();
       return;
     }
-    const start = performance.now() - elapsed * 1000;
+    const start = performance.now() - playbackElapsed * 1000;
     setPlaying(true);
     if (selected.blob || selected.hasAudio) {
       const sourceUrl = selected.blob
@@ -345,10 +345,10 @@ export default function Home() {
         : `/stt-api/api/recordings/${selected.id}/audio`;
       const audio = new Audio(sourceUrl);
       player.current = audio;
-      audio.currentTime = elapsed >= selected.duration ? 0 : elapsed;
+      audio.currentTime = playbackElapsed >= selected.duration ? 0 : playbackElapsed;
       audio.play().catch(() => setNotice("브라우저에서 오디오 재생을 허용해 주세요."));
       audio.onended = () => {
-        setElapsed(0);
+        setPlaybackElapsed(0);
         setPlaying(false);
       };
     }
@@ -357,15 +357,15 @@ export default function Home() {
         ? player.current.currentTime
         : (performance.now() - start) / 1000;
       if (next >= selected.duration) {
-        setElapsed(0);
+        setPlaybackElapsed(0);
         setPlaying(false);
         return;
       }
-      setElapsed(next);
+      setPlaybackElapsed(next);
       playTimer.current = requestAnimationFrame(tick);
     };
     playTimer.current = requestAnimationFrame(tick);
-  }, [elapsed, playing, selected, stopPlayback]);
+  }, [playbackElapsed, playing, selected, stopPlayback]);
 
   const stopRecording = useCallback(async () => {
     if (!recording || stopping.current) return;
@@ -440,9 +440,8 @@ export default function Home() {
       noSignalStartedAt.current = 0;
       signalWarningActive.current = false;
       lastDiagnosticsAt.current = 0;
-      setLiveWaveform(waveform.current);
       startedAt.current = performance.now();
-      setElapsed(0);
+      setRecordingElapsed(0);
       setLiveText("");
       setInterimText("로컬 STT 서버에 연결하고 있습니다…");
 
@@ -467,7 +466,18 @@ export default function Home() {
       };
 
       const handleSocketMessage = (socket: WebSocket, message: MessageEvent) => {
-        const event = JSON.parse(String(message.data)) as SttEvent;
+        let event: SttEvent;
+        try {
+          event = JSON.parse(String(message.data)) as SttEvent;
+        } catch {
+          intentionalSocketClose.current = true;
+          recordingActive.current = false;
+          setRecording(false);
+          setCaptureStatus("error");
+          setNotice("STT 서버가 올바르지 않은 응답을 전송했습니다. 서버를 다시 시작해 주세요.");
+          socket.close();
+          return;
+        }
         if (event.type === "ready") {
           setSystemOnline(Boolean(event.whisperReady));
           setModelName(event.model || "LOCAL STT");
@@ -525,6 +535,8 @@ export default function Home() {
             ...current.filter((item) => item.id !== savedRecording.id),
           ]);
           setSelected(savedRecording);
+          setPlaybackElapsed(0);
+          setRecordingElapsed(0);
           setLiveText(savedRecording.segments.map((part) => part.text).join(" "));
           setInterimText("");
           setRecording(false);
@@ -691,7 +703,7 @@ export default function Home() {
 
       const meter = () => {
         const now = performance.now();
-        setElapsed((now - startedAt.current) / 1000);
+        setRecordingElapsed((now - startedAt.current) / 1000);
 
         if (now - lastWaveformSampleAt.current >= WAVEFORM_SAMPLE_INTERVAL_MS) {
           leftAnalyser.getFloatTimeDomainData(leftWaveformData);
@@ -722,7 +734,6 @@ export default function Home() {
 
           const nextWaveform = [...waveform.current.slice(1), enhanced.level];
           waveform.current = nextWaveform;
-          setLiveWaveform(nextWaveform);
           lastWaveformSampleAt.current = now;
 
           if (dominantAnalysis.rawLevel <= NO_SIGNAL_THRESHOLD) {
@@ -787,9 +798,10 @@ export default function Home() {
   };
 
   const selectRecording = (item: Recording) => {
+    if (recording) return;
     stopPlayback();
     setSelected(item);
-    setElapsed(0);
+    setPlaybackElapsed(0);
     setLiveText(item.segments.map((segment) => segment.text).join(" "));
   };
 
@@ -847,7 +859,7 @@ export default function Home() {
         : current);
       setRecordings([demoRecording]);
       setSelected(demoRecording);
-      setElapsed(0);
+      setPlaybackElapsed(0);
       setLiveText(demoRecording.segments.map((segment) => segment.text).join(" "));
       setNotice("저장된 데모 기록을 초기화했습니다.");
     } catch {
@@ -885,17 +897,15 @@ export default function Home() {
   };
 
   const activeSegment = selected.segments.findIndex(
-    (segment) => elapsed >= segment.start && elapsed < segment.end,
+    (segment) => playbackElapsed >= segment.start && playbackElapsed < segment.end,
   );
   const reviewCount = selected.segments.filter(
     (segment) => segment.reviewRequired,
   ).length;
   const meterBars = Array.from({ length: 18 });
-  const displayedWaveform = recording
-    ? liveWaveform
-    : selected.waveform?.length
-      ? selected.waveform
-      : demoWaveform;
+  const displayedWaveform = selected.waveform?.length
+    ? selected.waveform
+    : demoWaveform;
 
   return (
     <main className="shell">
@@ -964,21 +974,21 @@ export default function Home() {
               <span className="recordIcon">{recording ? "■" : "●"}</span>
               <span>{recording ? "STOP & SAVE" : "START RECOGNITION"}<small>{recording ? "녹음 종료 및 저장" : "음성인식 시작"}</small></span>
             </button>
-            <div className="timer">{formatTime(elapsed)}<small>REC TIME</small></div>
+            <div className="timer">{formatTime(recordingElapsed)}<small>REC TIME</small></div>
           </div>
           {notice && <div className="notice">{notice}</div>}
         </article>
 
-        <article className="panel archivePanel">
+        <article className={`panel archivePanel ${recording ? "isLocked" : ""}`}>
           <div className="panelHead">
             <div><span className="step orange">02</span><div><h2>RECORD ARCHIVE</h2><p>음성·텍스트 통합 기록</p></div></div>
-            <button className="archiveClear" onClick={clearRecordings}>
+            <button className="archiveClear" onClick={clearRecordings} disabled={recording}>
               CLEAR · {recordings.length.toString().padStart(2, "0")} FILES
             </button>
           </div>
           <div className="archiveList">
             {recordings.map((item) => (
-              <button className={`archiveItem ${selected.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => selectRecording(item)}>
+              <button className={`archiveItem ${selected.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => selectRecording(item)} disabled={recording}>
                 <span className="fileIcon">▥</span>
                 <span className="fileCopy"><strong>{item.title}</strong><small>{item.createdAt} · {formatTime(item.duration)}</small></span>
                 <span className="filePlay">▶</span>
@@ -988,11 +998,11 @@ export default function Home() {
         </article>
       </section>
 
-      <section className="panel playbackPanel">
+      <section className={`panel playbackPanel ${recording ? "isLocked" : ""}`}>
         <div className="playbackTop">
           <div className="nowPlaying">
             <span className="step purple">03</span>
-            <div><small>NOW ANALYZING</small><h2>{selected.title}</h2></div>
+            <div><small>{recording ? "ARCHIVE PAUSED" : "NOW ANALYZING"}</small><h2>{selected.title}</h2></div>
           </div>
           <div className="playbackActions">
             <div className="chips">
@@ -1012,13 +1022,14 @@ export default function Home() {
                 {audioDiagnostics.channels > 1 ? "STEREO" : "MONO"}
               </span>
             </div>
-            <button className="downloadButton" onClick={downloadTranscript} aria-label="인식 텍스트 다운로드">
+            <button className="downloadButton" onClick={downloadTranscript} aria-label="인식 텍스트 다운로드" disabled={recording}>
               ↓ <span>TEXT</span>
             </button>
             <button
               className="downloadButton audio"
               onClick={downloadAudio}
               aria-label="녹음 음성 파일 다운로드"
+              disabled={recording}
               title={selected.blob || selected.hasAudio ? "음성 파일 다운로드" : "직접 녹음한 파일에서 사용할 수 있습니다"}
             >
               ↓ <span>AUDIO</span>
@@ -1036,49 +1047,48 @@ export default function Home() {
             {playing ? "Ⅱ" : "▶"}
           </button>
           <div className="timelineWrap">
-            <div className={`waveform ${recording ? "isLive" : ""}`} aria-hidden="true">
+            <div className="waveform" aria-hidden="true">
               {displayedWaveform.map((amplitude, index) => (
                 <i
                   key={index}
                   style={{ height: `${Math.max(4, Math.round(amplitude * 54))}px` }}
                 />
               ))}
-              {recording ? (
-                <div className="waveLiveEdge" />
-              ) : (
-                <div className="waveProgress" style={{ width: `${Math.min(100, (elapsed / selected.duration) * 100)}%` }} />
-              )}
+              <div className="waveProgress" style={{ width: `${Math.min(100, (playbackElapsed / selected.duration) * 100)}%` }} />
             </div>
             <input
               type="range"
               min="0"
-              max={recording ? Math.max(1, elapsed) : selected.duration}
+              max={selected.duration}
               step="0.05"
-              value={elapsed}
+              value={playbackElapsed}
               disabled={recording}
               onChange={(event) => {
                 const value = Number(event.target.value);
-                setElapsed(value);
+                setPlaybackElapsed(value);
                 if (player.current) player.current.currentTime = value;
               }}
               aria-label="재생 위치"
             />
             <div className="timecodes">
-              <span>{recording ? "LIVE" : formatTime(elapsed)}</span>
-              <span>{formatTime(recording ? elapsed : selected.duration)}</span>
+              <span>{formatTime(playbackElapsed)}</span>
+              <span>{formatTime(selected.duration)}</span>
             </div>
           </div>
         </div>
 
         <div className="transcriptBox">
-          <div className="transcriptHead"><span>LIVE TRANSCRIPT</span><span><i /> SYNCED WITH AUDIO</span></div>
+          <div className="transcriptHead">
+            <span>{recording ? "ARCHIVE TRANSCRIPT" : "LIVE TRANSCRIPT"}</span>
+            <span><i /> {recording ? "PLAYBACK PAUSED" : "SYNCED WITH AUDIO"}</span>
+          </div>
           <div className="transcriptText">
             {selected.segments.map((segment, index) => (
               <div className="transcriptSegmentWrap" key={`${segment.start}-${index}`}>
                 <button
                   className={[
                     "transcriptSegment",
-                    activeSegment === index && (playing || elapsed > 0)
+                    activeSegment === index && (playing || playbackElapsed > 0)
                       ? "highlight"
                       : "",
                     segment.reviewRequired ? "needsReview" : "",
@@ -1089,9 +1099,11 @@ export default function Home() {
                       : undefined
                   }
                   onClick={() => {
-                    setElapsed(segment.start);
+                    if (recording) return;
+                    setPlaybackElapsed(segment.start);
                     if (player.current) player.current.currentTime = segment.start;
                   }}
+                  disabled={recording}
                 >
                   <time>{formatTime(segment.start)}</time>
                   <span>{segment.text}</span>

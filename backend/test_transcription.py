@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 
 import numpy as np
@@ -24,33 +25,29 @@ class FakeTranscriber(WhisperTranscriber):
             asyncio.Lock(),
         )
         self.requests = 0
+        self.request_sizes: list[int] = []
+        self.previous_text_options: list[bool] = []
+        self.avg_logprob = -0.8
 
     async def request(
         self,
         pcm_bytes: bytes,
         verbose: bool = True,
         use_prompt: bool = False,
+        condition_on_previous_text: bool = False,
     ):
         self.requests += 1
-        if self.requests == 1:
-            return {
-                "text": "이 타난서의 내용입니다.",
-                "segments": [{
-                    "text": "이 타난서의 내용입니다.",
-                    "start": 20.0,
-                    "end": 25.0,
-                    "avg_logprob": -0.8,
-                }],
-            }, 100.0
+        self.request_sizes.append(len(pcm_bytes))
+        self.previous_text_options.append(condition_on_previous_text)
         return {
-            "text": "이 탄원서의 내용입니다.",
+            "text": "이 타난서의 내용입니다.",
             "segments": [{
-                "text": "이 탄원서의 내용입니다.",
+                "text": "이 타난서의 내용입니다.",
                 "start": 0.0,
                 "end": 3.0,
-                "avg_logprob": -0.2,
+                "avg_logprob": self.avg_logprob,
             }],
-        }, 80.0
+        }, 100.0
 
 
 class TranscriptionTests(unittest.IsolatedAsyncioTestCase):
@@ -118,16 +115,27 @@ class TranscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(segments, [])
         self.assertFalse(diagnostics["vadFallback"])
 
-    async def test_complete_session_merges_overlap(self) -> None:
+    async def test_complete_session_uses_one_continuous_decoding_pass(self) -> None:
         transcriber = FakeTranscriber()
         samples = np.full(16000 * 27, 1200, dtype="<i2").tobytes()
         segments, diagnostics = await transcriber.complete_session(samples)
-        self.assertEqual(transcriber.requests, 2)
+        self.assertEqual(transcriber.requests, 1)
+        self.assertEqual(transcriber.request_sizes, [len(samples)])
+        self.assertEqual(transcriber.previous_text_options, [True])
         self.assertEqual(len(segments), 1)
         self.assertEqual(segments[0]["text"], "이 탄원서의 내용입니다.")
         self.assertTrue(segments[0]["reviewRequired"])
-        self.assertEqual(diagnostics["deduplicatedSegments"], 1)
-        self.assertEqual(diagnostics["windowCount"], 2)
+        self.assertEqual(diagnostics["deduplicatedSegments"], 0)
+        self.assertEqual(diagnostics["windowCount"], 1)
+        self.assertTrue(diagnostics["continuousDecoding"])
+
+    async def test_non_finite_model_metric_becomes_json_null(self) -> None:
+        transcriber = FakeTranscriber()
+        transcriber.avg_logprob = float("nan")
+        samples = np.full(16000, 1200, dtype="<i2").tobytes()
+        segments, _ = await transcriber.complete_session(samples)
+        self.assertIsNone(segments[0]["avgLogprob"])
+        json.dumps(segments, allow_nan=False)
 
 
 if __name__ == "__main__":

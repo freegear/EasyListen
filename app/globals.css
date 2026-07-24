@@ -154,12 +154,15 @@ h1 em { color: transparent; font-style: normal; -webkit-text-stroke: 1px #2c8fc3
 .archiveList { padding: 12px; height: 328px; overflow: auto; }
 .archiveClear { border: 0; background: transparent; color: #486e88; font: 700 9px monospace; cursor: pointer; }
 .archiveClear:hover { color: #ff9e6f; }
+.archiveClear:disabled { cursor: default; color: #31495c; }
 .archiveItem {
   width: 100%; border: 1px solid transparent; background: transparent; padding: 15px 12px;
   display: flex; align-items: center; gap: 12px; text-align: left; cursor: pointer; border-bottom-color: #11263a;
 }
 .archiveItem:hover, .archiveItem.selected { background: #0b2236; border-color: #174662; }
 .archiveItem.selected { box-shadow: inset 3px 0 #2ad8ef; }
+.archiveItem:disabled { cursor: default; }
+.archivePanel.isLocked .archiveItem:not(.selected) { opacity: .62; }
 .fileIcon { width: 34px; height: 34px; display: grid; place-items: center; color: #53cce8; background: #0c2d42; border: 1px solid #175473; }
 .fileCopy { min-width: 0; flex: 1; }
 .fileCopy strong { display: block; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -168,6 +171,9 @@ h1 em { color: transparent; font-style: normal; -webkit-text-stroke: 1px #2c8fc3
 
 .playbackPanel { margin-top: 16px; margin-bottom: 22px; width: calc(100% - 56px); }
 .playbackPanel::after { background: #aa77ff; box-shadow: 0 0 12px #aa77ff; }
+.playbackPanel.isLocked { border-color: #263449; }
+.playbackPanel.isLocked .nowPlaying small { color: #68798b; }
+.playbackPanel.isLocked .transcriptSegment { cursor: default; }
 .playbackTop { display: flex; align-items: center; justify-content: space-between; padding: 19px 24px; border-bottom: 1px solid var(--line); }
 .nowPlaying small { color: #8f6fc4; font: 700 8px monospace; letter-spacing: .14em; }
 .nowPlaying h2 { margin-top: 4px; font-family: Arial; letter-spacing: 0; }
@@ -180,6 +186,7 @@ h1 em { color: transparent; font-style: normal; -webkit-text-stroke: 1px #2c8fc3
   transition: .18s;
 }
 .downloadButton:hover { border-color: #4be5f5; background: #0c354d; box-shadow: 0 0 15px #24cbe62b; }
+.downloadButton:disabled { opacity: .45; cursor: default; box-shadow: none; }
 .downloadButton.audio { border-color: #664a86; color: #c49af5; background: #1c1430; }
 .downloadButton.audio:hover { border-color: #b787f1; background: #2a1c45; box-shadow: 0 0 15px #9c68da2b; }
 .transport { padding: 23px 24px 13px; display: flex; align-items: center; gap: 22px; }

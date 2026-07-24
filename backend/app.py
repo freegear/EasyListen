@@ -343,7 +343,10 @@ async def stt_socket(websocket: WebSocket) -> None:
                         "hasAudio": True,
                         "diagnostics": diagnostics,
                     }
-                    storage.save(recording, pcm_to_wav(bytes(pcm_buffer)))
+                    recording = storage.save(
+                        recording,
+                        pcm_to_wav(bytes(pcm_buffer)),
+                    )
                     await websocket.send_json({"type": "saved", "recording": recording})
                     break
             elif message.get("bytes") is not None and started:

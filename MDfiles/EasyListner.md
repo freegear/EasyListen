@@ -57,7 +57,7 @@ mlx_whisper.transcribe(
     language="ko",
     task="transcribe",
     temperature=0.0,
-    condition_on_previous_text=False,
+    condition_on_previous_text=True,
     initial_prompt=legal_prompt,
     compression_ratio_threshold=2.4,
     logprob_threshold=-1.0,
@@ -72,7 +72,8 @@ mlx_whisper.transcribe(
 - `temperature=0.0`의 greedy decoding으로 결과 재현성을 높인다.
 - `mlx-whisper 0.4.3`은 beam search가 구현되어 있지 않아 `beam_size`를
   전달하지 않는다.
-- `condition_on_previous_text=False`로 장시간 녹음의 반복 루프를 줄인다.
+- 최종 전사는 전체 녹음을 한 번에 전달하고 `condition_on_previous_text=True`로 이전 구간의 문맥을 유지한다.
+- VAD는 무음 판정과 진단에만 사용하며, 발화 구간을 잘라 전사하지 않아 경계의 단어와 문장이 누락되지 않게 한다.
 - 임시 자막에는 전문용어 프롬프트를 사용하지 않는다.
 - `ENABLE_LEGAL_PROMPT=true`일 때만 최종 자막에 짧은 전문용어 목록을 사용한다.
 
@@ -189,8 +190,6 @@ M3 24GB 환경에서는 FP16 `large-v3-turbo`를 먼저 검증한다. Q4 모델�
 | `WHISPER_MODEL_REPO` | `mlx-community/whisper-large-v3-turbo` | 설치 시 모델 저장소 |
 | `SILERO_MODEL_PATH` | `.demo/models/silero_vad.onnx` | VAD 모델 경로 |
 | `ENABLE_LEGAL_PROMPT` | `false` | 최종 전사의 법률용어 프롬프트 사용 |
-| `FINAL_WINDOW_SECONDS` | `25` | 긴 발화 분할 길이 |
-| `FINAL_WINDOW_OVERLAP_SECONDS` | `1.5` | 긴 발화 창 중첩 |
 | `LOW_CONFIDENCE_LOGPROB` | `-0.65` | 낮은 로그 확률 검토 기준 |
 | `NO_SPEECH_REVIEW_THRESHOLD` | `0.6` | 비음성 검토 기준 |
 | `COMPRESSION_RATIO_REVIEW_THRESHOLD` | `2.4` | 반복 출력 검토 기준 |

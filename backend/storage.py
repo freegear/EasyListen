@@ -1,11 +1,30 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
+
+
+def _json_dump(value: Any, ensure_ascii: bool = True) -> str:
+    return json.dumps(
+        json_safe(value),
+        ensure_ascii=ensure_ascii,
+        allow_nan=False,
+    )
 
 
 class RecordingStorage:
@@ -47,6 +66,29 @@ class RecordingStorage:
                     "ALTER TABLE recordings "
                     "ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            for row in connection.execute(
+                "SELECT id, segments_json, waveform_json, diagnostics_json "
+                "FROM recordings"
+            ).fetchall():
+                connection.execute(
+                    """
+                    UPDATE recordings
+                    SET segments_json = ?, waveform_json = ?, diagnostics_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        _json_dump(
+                            json.loads(row["segments_json"]),
+                            ensure_ascii=False,
+                        ),
+                        _json_dump(json.loads(row["waveform_json"])),
+                        _json_dump(
+                            json.loads(row["diagnostics_json"]),
+                            ensure_ascii=False,
+                        ),
+                        row["id"],
+                    ),
+                )
 
     @staticmethod
     def _serialize(row: sqlite3.Row) -> dict[str, Any]:
@@ -55,13 +97,14 @@ class RecordingStorage:
             "title": row["title"],
             "createdAt": row["created_at"],
             "duration": row["duration"],
-            "segments": json.loads(row["segments_json"]),
-            "waveform": json.loads(row["waveform_json"]),
-            "diagnostics": json.loads(row["diagnostics_json"]),
+            "segments": json_safe(json.loads(row["segments_json"])),
+            "waveform": json_safe(json.loads(row["waveform_json"])),
+            "diagnostics": json_safe(json.loads(row["diagnostics_json"])),
             "hasAudio": True,
         }
 
     def save(self, recording: dict[str, Any], wav_bytes: bytes) -> dict[str, Any]:
+        recording = json_safe(recording)
         audio_path = self.recordings_dir / f"{recording['id']}.wav"
         audio_path.write_bytes(wav_bytes)
         with self.lock, self._connect() as connection:
@@ -77,10 +120,13 @@ class RecordingStorage:
                     recording["title"],
                     recording["createdAt"],
                     recording["duration"],
-                    json.dumps(recording["segments"], ensure_ascii=False),
-                    json.dumps(recording["waveform"]),
+                    _json_dump(recording["segments"], ensure_ascii=False),
+                    _json_dump(recording["waveform"]),
                     str(audio_path),
-                    json.dumps(recording.get("diagnostics", {}), ensure_ascii=False),
+                    _json_dump(
+                        recording.get("diagnostics", {}),
+                        ensure_ascii=False,
+                    ),
                 ),
             )
         return recording
@@ -115,7 +161,7 @@ class RecordingStorage:
             cursor = connection.execute(
                 "UPDATE recordings SET segments_json = ? WHERE id = ?",
                 (
-                    json.dumps(segments, ensure_ascii=False),
+                    _json_dump(segments, ensure_ascii=False),
                     recording_id,
                 ),
             )
