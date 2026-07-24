@@ -1,0 +1,7 @@
+.demo/
+.wrangler/
+.next/
+dist/
+node_modules/
+__pycache__/
+*.pyc
