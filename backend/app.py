@@ -15,9 +15,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
+from audio_processing import (
+    CAPTURE_BYTES_PER_SECOND,
+    CAPTURE_SAMPLE_RATE,
+    Streaming48kTo16kResampler,
+    WHISPER_BYTES_PER_SECOND,
+    WHISPER_SAMPLE_RATE,
+)
+from noise_suppression import DeepFilterNoiseSuppressor
 from storage import RecordingStorage
 from transcription import (
-    BYTES_PER_SECOND,
     WhisperTranscriber,
     contains_possible_speech,
     load_legal_context,
@@ -38,7 +45,7 @@ WHISPER_MODEL_PATH = Path(
         RUNTIME_DIR / "models" / "whisper-large-v3-turbo",
     )
 )
-SAMPLE_RATE = 16000
+SAMPLE_RATE = WHISPER_SAMPLE_RATE
 RETENTION_DAYS = max(0, int(os.getenv("RECORDING_RETENTION_DAYS", "30")))
 MAX_RECORDING_SECONDS = max(
     60, int(os.getenv("MAX_RECORDING_SECONDS", str(30 * 60)))
@@ -48,7 +55,16 @@ LEGAL_PROMPT_ENABLED = os.getenv("ENABLE_LEGAL_PROMPT", "false").lower() in {
     "true",
     "yes",
 }
-INTERIM_WINDOW_BYTES = 8 * BYTES_PER_SECOND
+DEEPFILTER_ENABLED = os.getenv("ENABLE_DEEPFILTER", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+DEEPFILTER_MODEL = os.getenv("DEEPFILTER_MODEL", "DeepFilterNet3")
+DEEPFILTER_ATTENUATION_LIMIT_DB = float(
+    os.getenv("DEEPFILTER_ATTEN_LIMIT_DB", "18")
+)
+INTERIM_WINDOW_BYTES = 8 * WHISPER_BYTES_PER_SECOND
 
 storage = RecordingStorage(
     RUNTIME_DIR / "easylistener.sqlite3",
@@ -63,6 +79,11 @@ transcriber = WhisperTranscriber(
     legal_prompt,
     legal_corrections,
     inference_lock,
+)
+noise_suppressor = DeepFilterNoiseSuppressor(
+    enabled=DEEPFILTER_ENABLED,
+    model_name=DEEPFILTER_MODEL,
+    attenuation_limit_db=DEEPFILTER_ATTENUATION_LIMIT_DB,
 )
 app = FastAPI(title="EasyListner Local STT API", version="1.0.0")
 app.add_middleware(
@@ -81,6 +102,7 @@ class SegmentReview(BaseModel):
 @app.on_event("startup")
 async def cleanup_expired_recordings() -> None:
     storage.cleanup_older_than(RETENTION_DAYS)
+    await noise_suppressor.initialize()
 
 
 async def whisper_ready() -> bool:
@@ -95,6 +117,12 @@ async def health() -> dict[str, Any]:
         "model": WHISPER_MODEL,
         "engine": "mlx-whisper",
         "sampleRate": SAMPLE_RATE,
+        "captureSampleRate": CAPTURE_SAMPLE_RATE,
+        "noiseSuppression": (
+            noise_suppressor.enabled
+            and noise_suppressor.model is not None
+        ),
+        "noiseSuppressionModel": DEEPFILTER_MODEL,
     }
 
 
@@ -115,6 +143,11 @@ async def capabilities() -> dict[str, Any]:
         "maxRecordingSeconds": MAX_RECORDING_SECONDS,
         "legalPrompt": bool(legal_prompt),
         "legalCorrections": len(legal_corrections),
+        "noiseSuppressionEnabled": DEEPFILTER_ENABLED,
+        "noiseSuppressionReady": noise_suppressor.model is not None,
+        "noiseSuppressionModel": DEEPFILTER_MODEL,
+        "captureSampleRate": CAPTURE_SAMPLE_RATE,
+        "whisperSampleRate": WHISPER_SAMPLE_RATE,
     }
 
 
@@ -136,6 +169,17 @@ async def get_audio(recording_id: str) -> FileResponse:
     audio_path = storage.audio_path(recording_id)
     if not audio_path:
         raise HTTPException(status_code=404, detail="음성 파일을 찾을 수 없습니다.")
+    return FileResponse(audio_path, media_type="audio/wav", filename=audio_path.name)
+
+
+@app.get("/api/recordings/{recording_id}/audio/enhanced")
+async def get_enhanced_audio(recording_id: str) -> FileResponse:
+    audio_path = storage.audio_path(recording_id, enhanced=True)
+    if not audio_path:
+        raise HTTPException(
+            status_code=404,
+            detail="향상된 음성 파일을 찾을 수 없습니다.",
+        )
     return FileResponse(audio_path, media_type="audio/wav", filename=audio_path.name)
 
 
@@ -193,7 +237,9 @@ async def clear_recordings() -> dict[str, int]:
 async def stt_socket(websocket: WebSocket) -> None:
     await websocket.accept()
     session_id = str(uuid.uuid4())
-    pcm_buffer = bytearray()
+    source_buffer = bytearray()
+    whisper_buffer = bytearray()
+    streaming_resampler = Streaming48kTo16kResampler()
     speech_start_byte = 0
     segments: list[dict[str, Any]] = []
     waveform: list[float] = []
@@ -216,7 +262,7 @@ async def stt_socket(websocket: WebSocket) -> None:
 
     async def finalize_speech(end_byte: int) -> None:
         nonlocal speech_start_byte, interim_task
-        segment_pcm = bytes(pcm_buffer[speech_start_byte:end_byte])
+        segment_pcm = bytes(whisper_buffer[speech_start_byte:end_byte])
         if len(segment_pcm) < SAMPLE_RATE:
             return
         if interim_task and not interim_task.done():
@@ -260,10 +306,10 @@ async def stt_socket(websocket: WebSocket) -> None:
                             "message": "지원하지 않는 오디오 형식입니다. pcm_s16le가 필요합니다.",
                         })
                         continue
-                    if int(payload.get("sampleRate", 0)) != SAMPLE_RATE:
+                    if int(payload.get("sampleRate", 0)) != CAPTURE_SAMPLE_RATE:
                         await websocket.send_json({
                             "type": "error",
-                            "message": "지원하지 않는 샘플레이트입니다. 16000Hz가 필요합니다.",
+                            "message": "지원하지 않는 샘플레이트입니다. 48000Hz가 필요합니다.",
                         })
                         continue
                     session_id = str(payload.get("sessionId") or session_id)
@@ -281,35 +327,51 @@ async def stt_socket(websocket: WebSocket) -> None:
                         if isinstance(value, (int, float))
                     ][-180:]
                     if vad.triggered:
-                        speech_ranges.append((speech_start_byte, len(pcm_buffer)))
+                        speech_ranges.append((speech_start_byte, len(whisper_buffer)))
                         await websocket.send_json({"type": "speech_end"})
                     if interim_task and not interim_task.done():
                         await interim_task
                     interim_task = None
-                    duration = len(pcm_buffer) / 2 / SAMPLE_RATE
+                    flushed_pcm, flushed_samples = streaming_resampler.flush()
+                    if flushed_pcm:
+                        whisper_buffer.extend(flushed_pcm)
+                        for event_type, probability in vad.accept(flushed_samples):
+                            await websocket.send_json({
+                                "type": event_type,
+                                "probability": round(probability, 4),
+                            })
+                    duration = len(source_buffer) / 2 / CAPTURE_SAMPLE_RATE
                     await websocket.send_json({
                         "type": "finalizing",
                         "current": 0,
-                        "total": 1,
+                        "total": 2,
                     })
 
                     async def report_progress(current: int, total: int) -> None:
                         await websocket.send_json({
                             "type": "finalizing",
-                            "current": current,
-                            "total": total,
+                            "current": current + 1,
+                            "total": total + 1,
                         })
 
+                    enhancement = await noise_suppressor.prepare(
+                        bytes(source_buffer)
+                    )
+                    await websocket.send_json({
+                        "type": "finalizing",
+                        "current": 1,
+                        "total": 2,
+                    })
                     final_segments, diagnostics = (
                         await transcriber.complete_session(
-                            bytes(pcm_buffer),
+                            enhancement.whisper_pcm,
                             speech_ranges=speech_ranges,
                             progress=report_progress,
                         )
                     )
                     segments = final_segments
                     client_samples = int(payload.get("emittedSamples", 0))
-                    server_samples = len(pcm_buffer) // 2
+                    server_samples = len(source_buffer) // 2
                     diagnostics.update({
                         "receivedFrames": received_frames,
                         "serverSamples": server_samples,
@@ -318,6 +380,14 @@ async def stt_socket(websocket: WebSocket) -> None:
                         "workletFlushed": bool(payload.get("workletFlushed")),
                         "vadDetected": speech_observed,
                         "maximumRms": round(maximum_rms, 6),
+                        "browserNoiseSuppression": bool(
+                            payload.get("browserNoiseSuppression")
+                        ),
+                        "streamingResampleDurationDifferenceMs": round(
+                            streaming_resampler.duration_difference_seconds * 1000,
+                            3,
+                        ),
+                        **enhancement.diagnostics,
                     })
                     await websocket.send_json({
                         "type": "final_replace",
@@ -341,11 +411,23 @@ async def stt_socket(websocket: WebSocket) -> None:
                         }],
                         "waveform": waveform,
                         "hasAudio": True,
+                        "hasEnhancedAudio": enhancement.enhanced_pcm is not None,
                         "diagnostics": diagnostics,
                     }
                     recording = storage.save(
                         recording,
-                        pcm_to_wav(bytes(pcm_buffer)),
+                        pcm_to_wav(
+                            bytes(source_buffer),
+                            sample_rate=CAPTURE_SAMPLE_RATE,
+                        ),
+                        (
+                            pcm_to_wav(
+                                enhancement.enhanced_pcm,
+                                sample_rate=CAPTURE_SAMPLE_RATE,
+                            )
+                            if enhancement.enhanced_pcm is not None
+                            else None
+                        ),
                     )
                     await websocket.send_json({"type": "saved", "recording": recording})
                     break
@@ -357,46 +439,55 @@ async def stt_socket(websocket: WebSocket) -> None:
                         "message": "손상된 PCM 프레임을 수신했습니다.",
                     })
                     continue
-                if len(pcm_buffer) + len(chunk) > MAX_RECORDING_SECONDS * SAMPLE_RATE * 2:
+                if (
+                    len(source_buffer) + len(chunk)
+                    > MAX_RECORDING_SECONDS * CAPTURE_BYTES_PER_SECOND
+                ):
                     await websocket.send_json({
                         "type": "error",
                         "message": f"최대 녹음 시간 {MAX_RECORDING_SECONDS // 60}분을 초과했습니다.",
                     })
                     break
-                pcm_buffer.extend(chunk)
+                source_buffer.extend(chunk)
                 received_frames += 1
-                samples = np.frombuffer(chunk, dtype="<i2").astype(np.float32) / 32768.0
-                if samples.size:
+                source_samples = (
+                    np.frombuffer(chunk, dtype="<i2").astype(np.float32)
+                    / 32768.0
+                )
+                resampled_pcm, samples = streaming_resampler.accept(chunk)
+                whisper_buffer.extend(resampled_pcm)
+                if source_samples.size:
                     maximum_rms = max(
                         maximum_rms,
-                        float(np.sqrt(np.mean(np.square(samples)))),
+                        float(np.sqrt(np.mean(np.square(source_samples)))),
                     )
                 for event_type, probability in vad.accept(samples):
                     if event_type == "speech_start":
                         speech_observed = True
                         speech_start_byte = max(
                             0,
-                            len(pcm_buffer) - BYTES_PER_SECOND,
+                            len(whisper_buffer) - WHISPER_BYTES_PER_SECOND,
                         )
                     await websocket.send_json({
                         "type": event_type,
                         "probability": round(probability, 4),
                     })
                     if event_type == "speech_end":
-                        speech_ranges.append((speech_start_byte, len(pcm_buffer)))
-                        await finalize_speech(len(pcm_buffer))
+                        speech_ranges.append((speech_start_byte, len(whisper_buffer)))
+                        await finalize_speech(len(whisper_buffer))
                 if (
-                    len(pcm_buffer) - last_interim_byte >= BYTES_PER_SECOND * 3
+                    len(whisper_buffer) - last_interim_byte
+                    >= WHISPER_BYTES_PER_SECOND * 3
                     and (interim_task is None or interim_task.done())
                 ):
                     snapshot_start = (
                         speech_start_byte
                         if vad.triggered
-                        else max(0, len(pcm_buffer) - INTERIM_WINDOW_BYTES)
+                        else max(0, len(whisper_buffer) - INTERIM_WINDOW_BYTES)
                     )
-                    snapshot = bytes(pcm_buffer[snapshot_start:])
+                    snapshot = bytes(whisper_buffer[snapshot_start:])
                     if vad.triggered or contains_possible_speech(snapshot):
-                        last_interim_byte = len(pcm_buffer)
+                        last_interim_byte = len(whisper_buffer)
                         interim_task = asyncio.create_task(
                             emit_interim(snapshot)
                         )

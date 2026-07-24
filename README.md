@@ -17,7 +17,7 @@ npm install
 `mlx-community/whisper-large-v3-turbo` 모델을 로컬에 다운로드합니다.
 
 상세 설계와 모델 검토 결과는
-[`MDfiles/EasyListner.md`](MDfiles/EasyListner.md)를 참고합니다.
+[`MDfiles/EasyListener.md`](MDfiles/EasyListener.md)를 참고합니다.
 
 ## Web Starter
 

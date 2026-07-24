@@ -38,6 +38,7 @@ type Recording = {
   blob?: Blob;
   demo?: boolean;
   hasAudio?: boolean;
+  hasEnhancedAudio?: boolean;
   diagnostics?: RecordingDiagnostics;
 };
 
@@ -77,6 +78,11 @@ type SystemCapabilities = {
   maxRecordingSeconds: number;
   legalPrompt?: boolean;
   legalCorrections?: number;
+  noiseSuppressionEnabled?: boolean;
+  noiseSuppressionReady?: boolean;
+  noiseSuppressionModel?: string;
+  captureSampleRate?: number;
+  whisperSampleRate?: number;
 };
 
 declare global {
@@ -253,6 +259,7 @@ export default function Home() {
   >(null);
   const player = useRef<HTMLAudioElement | null>(null);
   const playTimer = useRef<number | null>(null);
+  const browserNoiseSuppression = useRef(false);
 
   useEffect(() => {
     const accessInfoTimer = window.setTimeout(() => {
@@ -409,6 +416,7 @@ export default function Home() {
         title: `음성 명령 기록 ${(recordings.length).toString().padStart(2, "0")}`,
         emittedSamples: flushResult.emittedSamples,
         workletFlushed: flushResult.flushed,
+        browserNoiseSuppression: browserNoiseSuppression.current,
       }));
     } else {
       stopping.current = false;
@@ -424,7 +432,11 @@ export default function Home() {
     stopPlayback();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 2, echoCancellation: true, noiseSuppression: true },
+        audio: {
+          channelCount: 2,
+          echoCancellation: true,
+          noiseSuppression: capabilities?.noiseSuppressionReady === false,
+        },
       });
       streamRef.current = stream;
       setCaptureStatus("connecting");
@@ -609,7 +621,7 @@ export default function Home() {
           type: "start",
           sessionId,
           language: "ko",
-          sampleRate: 16000,
+          sampleRate: 48000,
           format: "pcm_s16le",
         }));
         if (replayAudio) {
@@ -630,7 +642,7 @@ export default function Home() {
         throw new Error("이 브라우저는 오디오 분석 기능을 지원하지 않습니다.");
       }
 
-      const context = new Context();
+      const context = new Context({ sampleRate: 48000 });
       audioContext.current = context;
 
       if (context.state === "suspended") {
@@ -643,6 +655,9 @@ export default function Home() {
 
       const audioTrack = stream.getAudioTracks()[0];
       const trackSettings = audioTrack?.getSettings();
+      browserNoiseSuppression.current = (
+        trackSettings?.noiseSuppression ?? false
+      );
       const detectedChannels = Math.max(
         1,
         Math.min(2, trackSettings?.channelCount ?? 1),
@@ -670,7 +685,7 @@ export default function Home() {
         contextState: context.state,
         noiseSuppression: trackSettings?.noiseSuppression ?? false,
       });
-      await context.audioWorklet.addModule("/audio-worklet.js");
+      await context.audioWorklet.addModule("/audio-worklet.js?v=dfn3-48k-v1");
       const pcmWorklet = new AudioWorkletNode(context, "easylistener-pcm");
       const silentGain = context.createGain();
       silentGain.gain.value = 0;
@@ -1008,6 +1023,7 @@ export default function Home() {
             <div className="chips">
               <span>KO-KR</span>
               <span>{modelName.toUpperCase()}</span>
+              {capabilities?.noiseSuppressionReady && <span>DFN3</span>}
               {reviewCount > 0 && <span className="reviewChip">REVIEW {reviewCount}</span>}
               <span
                 title={[

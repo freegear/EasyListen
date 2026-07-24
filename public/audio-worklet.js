@@ -2,7 +2,7 @@ class EasyListenerPcmProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.sourceRate = sampleRate;
-    this.targetRate = 16000;
+    this.targetRate = 48000;
     this.pending = [];
     this.emittedSamples = 0;
     this.port.onmessage = (event) => {

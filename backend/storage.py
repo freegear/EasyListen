@@ -53,6 +53,7 @@ class RecordingStorage:
                     segments_json TEXT NOT NULL,
                     waveform_json TEXT NOT NULL,
                     audio_path TEXT NOT NULL,
+                    enhanced_audio_path TEXT,
                     diagnostics_json TEXT NOT NULL DEFAULT '{}'
                 )
                 """
@@ -65,6 +66,10 @@ class RecordingStorage:
                 connection.execute(
                     "ALTER TABLE recordings "
                     "ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "enhanced_audio_path" not in columns:
+                connection.execute(
+                    "ALTER TABLE recordings ADD COLUMN enhanced_audio_path TEXT"
                 )
             for row in connection.execute(
                 "SELECT id, segments_json, waveform_json, diagnostics_json "
@@ -101,19 +106,32 @@ class RecordingStorage:
             "waveform": json_safe(json.loads(row["waveform_json"])),
             "diagnostics": json_safe(json.loads(row["diagnostics_json"])),
             "hasAudio": True,
+            "hasEnhancedAudio": bool(row["enhanced_audio_path"]),
         }
 
-    def save(self, recording: dict[str, Any], wav_bytes: bytes) -> dict[str, Any]:
+    def save(
+        self,
+        recording: dict[str, Any],
+        wav_bytes: bytes,
+        enhanced_wav_bytes: bytes | None = None,
+    ) -> dict[str, Any]:
         recording = json_safe(recording)
         audio_path = self.recordings_dir / f"{recording['id']}.wav"
         audio_path.write_bytes(wav_bytes)
+        enhanced_audio_path: Path | None = None
+        if enhanced_wav_bytes is not None:
+            enhanced_audio_path = (
+                self.recordings_dir / f"{recording['id']}.enhanced.wav"
+            )
+            enhanced_audio_path.write_bytes(enhanced_wav_bytes)
+        recording["hasEnhancedAudio"] = enhanced_audio_path is not None
         with self.lock, self._connect() as connection:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO recordings
                 (id, title, created_at, duration, segments_json, waveform_json,
-                 audio_path, diagnostics_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 audio_path, enhanced_audio_path, diagnostics_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     recording["id"],
@@ -123,6 +141,7 @@ class RecordingStorage:
                     _json_dump(recording["segments"], ensure_ascii=False),
                     _json_dump(recording["waveform"]),
                     str(audio_path),
+                    str(enhanced_audio_path) if enhanced_audio_path else None,
                     _json_dump(
                         recording.get("diagnostics", {}),
                         ensure_ascii=False,
@@ -167,24 +186,33 @@ class RecordingStorage:
             )
         return self.get(recording_id) if cursor.rowcount else None
 
-    def audio_path(self, recording_id: str) -> Path | None:
+    def audio_path(
+        self,
+        recording_id: str,
+        enhanced: bool = False,
+    ) -> Path | None:
+        column = "enhanced_audio_path" if enhanced else "audio_path"
         with self.lock, self._connect() as connection:
             row = connection.execute(
-                "SELECT audio_path FROM recordings WHERE id = ?", (recording_id,)
+                f"SELECT {column} AS requested_path FROM recordings WHERE id = ?",
+                (recording_id,),
             ).fetchone()
-        if not row:
+        if not row or not row["requested_path"]:
             return None
-        path = Path(row["audio_path"])
+        path = Path(row["requested_path"])
         return path if path.exists() else None
 
     def delete(self, recording_id: str) -> bool:
         audio_path = self.audio_path(recording_id)
+        enhanced_audio_path = self.audio_path(recording_id, enhanced=True)
         with self.lock, self._connect() as connection:
             cursor = connection.execute(
                 "DELETE FROM recordings WHERE id = ?", (recording_id,)
             )
         if audio_path:
             audio_path.unlink(missing_ok=True)
+        if enhanced_audio_path:
+            enhanced_audio_path.unlink(missing_ok=True)
         return cursor.rowcount > 0
 
     def clear(self) -> int:

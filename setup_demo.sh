@@ -29,6 +29,18 @@ fi
 "$VENV_DIR/bin/pip" install --upgrade pip
 "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/backend/requirements.txt"
 
+if [[ "${ENABLE_DEEPFILTER:-true}" =~ ^(1|true|yes)$ ]]; then
+  "$VENV_DIR/bin/python" <<'PY'
+from df.enhance import init_df
+
+init_df(
+    model_base_dir="DeepFilterNet3",
+    log_level="ERROR",
+    log_file=None,
+)
+PY
+fi
+
 if [[ ! -f "$MODELS_DIR/silero_vad.onnx" ]]; then
   curl --fail --location \
     --output "$MODELS_DIR/silero_vad.onnx" \
